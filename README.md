@@ -43,47 +43,104 @@ flowchart TB
 
 ## Prerequisites
 
-- AWS CLI configured with appropriate permissions
-- AWS SAM CLI v1.153+
-- Bedrock model access enabled for Claude Sonnet 4 (cross-region inference profile)
-- Python 3.13 (container build handles this if you have a different local version)
-- Finch or Docker (for container builds if local Python doesn't match)
+- **AWS CLI** configured with credentials that have permissions for Lambda, S3, VPC, IAM, API Gateway, and Bedrock
+- **AWS SAM CLI** v1.153+ ([install guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html))
+- **Bedrock model access** enabled for Claude Sonnet 4 in your target region (cross-region inference profile `us.anthropic.claude-sonnet-4-20250514-v1:0`)
+- **Python 3.13+** locally, or **Finch/Docker** for container builds (recommended)
 
-## Deploy
+## Setup
+
+### 1. Clone the repo
+
+```bash
+git clone https://github.com/singledigit/lambda-s3-files-example.git
+cd lambda-s3-files-example
+```
+
+### 2. Build
+
+If your local Python matches 3.13, you can build directly:
+
+```bash
+sam build
+```
+
+Otherwise, use a container build (requires Finch or Docker):
 
 ```bash
 sam build --use-container
+```
+
+### 3. Deploy
+
+```bash
 sam deploy --guided
 ```
 
-The first deploy creates a `samconfig.toml` with your settings. Subsequent deploys use it automatically.
-Override as needed:
+The guided deploy will prompt you for:
+- **Stack name**: e.g., `code-review-agents`
+- **Region**: any region with Bedrock Claude Sonnet 4 access
+- **Confirm changeset**: `Y`
+- **Allow IAM role creation**: `Y`
+- **Save to samconfig.toml**: `Y`
+
+This creates a `samconfig.toml` so subsequent deploys just need `sam deploy`.
+
+First deploy takes **10-15 minutes** (VPC, NAT gateway, and S3 Files mount targets take time to provision). Updates after that are much faster.
+
+## Testing
+
+### Start a review
+
+The `ApiEndpoint` stack output has the full URL. Use it with curl:
 
 ```bash
-sam deploy --parameter-overrides "BedrockModelId=us.anthropic.claude-sonnet-4-20250514-v1:0"
+curl -X POST <ApiEndpoint> \
+  -H "Content-Type: application/json" \
+  -d '{"repo_url": "https://github.com/singledigit/durable-serverlesspresso"}'
 ```
 
-First deploy takes ~10-15 minutes (VPC, NAT gateway, S3 Files mount targets).
-Updates are much faster.
+You'll get a `202 Accepted` response immediately. The review runs asynchronously in the background.
 
-## Usage
+### Check results
+
+Allow 2-3 minutes for the agents to clone the repo, analyze the code, and write findings. Then check the S3 bucket (the `WorkspaceBucketName` stack output):
 
 ```bash
-# Start a review
-curl -X POST https://<api-id>.execute-api.<region>.amazonaws.com/Prod/review \
-  -H "Content-Type: application/json" \
-  -d '{"repo_url": "https://github.com/owner/repo"}'
+# List review files
+aws s3 ls s3://<WorkspaceBucketName>/lambda/durable-serverlesspresso/reviews/
 
-# Check results in the S3 bucket (allow 2-3 minutes for agents to finish)
-aws s3 ls s3://<bucket-name>/lambda/<repo-name>/reviews/
-aws s3 cp s3://<bucket-name>/lambda/<repo-name>/reviews/summary.json -
+# View the combined summary
+aws s3 cp s3://<WorkspaceBucketName>/lambda/durable-serverlesspresso/reviews/summary.json - | python3 -m json.tool
+```
+
+You should see `security.json`, `style.json`, and `summary.json` with structured findings from both agents.
+
+### Troubleshooting
+
+- **No results after 5 minutes?** Check the orchestrator logs: `aws logs tail /aws/lambda/code-review-orchestrator --since 10m`
+- **Bedrock access denied?** Make sure you've enabled Claude Sonnet 4 model access in the Bedrock console for your region
+- **Mount permission errors?** The access point needs `CreationPermissions` with UID/GID 1000. See the IaC notes below.
+
+## Cleanup
+
+Remove all deployed resources:
+
+```bash
+sam delete
+```
+
+This deletes the entire CloudFormation stack including the VPC, S3 bucket, file system, and all Lambda functions. The S3 bucket must be empty for deletion to succeed. If it fails, empty the bucket first:
+
+```bash
+aws s3 rm s3://<WorkspaceBucketName> --recursive
+sam delete
 ```
 
 ## Project structure
 
 ```
 ├── template.yaml                          # Main SAM template
-├── samconfig.toml                         # Deploy defaults
 ├── src/
 │   ├── orchestrator/app.py                # Durable function
 │   ├── security_agent/app.py              # Strands security agent
@@ -106,8 +163,6 @@ S3 Files is brand new. A few things to know when writing CloudFormation:
 - Mount targets take ~5 minutes to create
 - cfn-lint doesn't recognize the S3Files resource types yet (false positive errors)
 
-## Cleanup
+## License
 
-```bash
-sam delete
-```
+MIT

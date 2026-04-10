@@ -1,8 +1,10 @@
 .aws-sam/
 blog/
+social/
 .kiro/
 samconfig.toml
 hand-drawn-diagrams/
 __pycache__/
 *.pyc
 .pytest_cache/
+.vscode
