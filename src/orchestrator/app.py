@@ -28,8 +28,6 @@ WORKSPACE = os.environ.get("WORKSPACE_MOUNT", "/mnt/workspace")
 SECURITY_AGENT_ARN = os.environ.get("SECURITY_AGENT_ARN", "")
 STYLE_AGENT_ARN = os.environ.get("STYLE_AGENT_ARN", "")
 
-# v6 - switch to python3.13 for Strands compatibility
-
 # File extensions we care about for code review
 CODE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs",

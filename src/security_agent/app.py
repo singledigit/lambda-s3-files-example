@@ -1,7 +1,7 @@
 """
-Style Review Agent — Uses Strands SDK with Bedrock to review code for
-style and quality issues. Reads files directly from the S3 Files mount
-using custom tools. No boto3 for file access — just open() and pathlib.
+Security Review Agent — Uses Strands SDK with Bedrock to review code for
+security issues. Reads files directly from the S3 Files mount using
+custom tools. No boto3 for file access — just open() and pathlib.
 """
 
 import json
@@ -15,7 +15,7 @@ from aws_lambda_powertools import Logger
 logger = Logger()
 
 WORKSPACE = os.environ.get("WORKSPACE_MOUNT", "/mnt/workspace")
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-4-20250514-v1:0")
+MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")
 
 # ── File tools that operate on the S3 Files mount ──────────────────
 
@@ -63,6 +63,7 @@ def read_file(path: str) -> str:
 
     try:
         content = target.read_text(encoding="utf-8", errors="ignore")
+        # Truncate very large files
         if len(content) > 50_000:
             content = content[:50_000] + "\n\n... [truncated — file exceeds 50KB]"
         return content
@@ -75,7 +76,7 @@ def write_review(filename: str, content: str) -> str:
     """Write review findings to a JSON file in the reviews directory.
 
     Args:
-        filename: Name of the output file (e.g. 'style.json').
+        filename: Name of the output file (e.g. 'security.json').
         content: The JSON content to write.
     """
     review_id = os.environ.get("CURRENT_REVIEW_ID", "")
@@ -89,31 +90,29 @@ def write_review(filename: str, content: str) -> str:
 
 # ── System prompt ──────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a code quality and style reviewer. You have access to a
-repository's source code through file tools. Your job is to:
+SYSTEM_PROMPT = """You are a security code reviewer. You have access to a repository's
+source code through file tools. Your job is to:
 
 1. Use list_files to explore the repository structure
 2. Use read_file to examine source files
-3. Review for code quality and style issues including:
-   - Naming conventions (variables, functions, classes)
-   - Code organization and structure
-   - Documentation and comments (missing, outdated, or excessive)
-   - Dead code or unused imports
-   - Code duplication
-   - Function/method length and complexity
-   - Error handling patterns
-   - Consistency across the codebase
-   - README quality and completeness
-   - Test coverage gaps (if test files exist)
-4. Use write_review to save your findings as a JSON file named 'style.json'
+3. Look for security vulnerabilities including:
+   - Hardcoded secrets, API keys, passwords, or tokens
+   - SQL injection vulnerabilities
+   - Cross-site scripting (XSS) risks
+   - Insecure deserialization
+   - Path traversal vulnerabilities
+   - Insecure cryptographic practices
+   - Missing input validation
+   - Overly permissive IAM policies or security configurations
+   - Sensitive data exposure
+4. Use write_review to save your findings as a JSON file named 'security.json'
 
 Your findings JSON should be an object with:
 - "findings": array of objects, each with: severity, file, line_hint, category, description, recommendation
 - "files_reviewed": number of files you examined
 - "summary": a brief overall assessment
 
-Severity levels: "high" for things that hurt maintainability, "medium" for
-inconsistencies, "low" for minor style nits. Be constructive, not pedantic."""
+Be thorough but practical. Focus on real risks, not theoretical ones."""
 
 
 # ── Lambda handler ─────────────────────────────────────────────────
@@ -124,9 +123,10 @@ def lambda_handler(event: dict, context) -> dict:
     if not review_id:
         raise ValueError("review_id is required")
 
+    # Set the review ID so tools can find the right workspace
     os.environ["CURRENT_REVIEW_ID"] = review_id
 
-    logger.info(f"Starting style review for {review_id}")
+    logger.info(f"Starting security review for {review_id}")
 
     model = BedrockModel(
         model_id=MODEL_ID,
@@ -139,16 +139,18 @@ def lambda_handler(event: dict, context) -> dict:
         system_prompt=SYSTEM_PROMPT,
     )
 
+    # Run the agent — it will explore files and write its review
     response = agent(
-        f"Review the source code in the workspace for code quality and style issues. "
+        f"Review the source code in the workspace for security issues. "
         f"The review ID is '{review_id}'. Start by listing the root directory "
         f"to understand the project structure, then read the key files and "
-        f"write your findings to 'style.json'."
+        f"write your findings to 'security.json'."
     )
 
-    logger.info("Style review complete")
+    logger.info("Security review complete")
 
-    results_path = Path(WORKSPACE) / review_id / "reviews" / "style.json"
+    # Read back the results if the agent wrote them
+    results_path = Path(WORKSPACE) / review_id / "reviews" / "security.json"
     if results_path.exists():
         results = json.loads(results_path.read_text())
     else:
@@ -156,6 +158,6 @@ def lambda_handler(event: dict, context) -> dict:
 
     return {
         "review_id": review_id,
-        "agent": "style",
+        "agent": "security",
         "results": results,
     }

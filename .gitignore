@@ -1,5 +1,7 @@
 .aws-sam/
 blog/
+.kiro/
+samconfig.toml
 __pycache__/
 *.pyc
 .pytest_cache/
