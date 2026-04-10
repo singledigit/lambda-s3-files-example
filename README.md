@@ -6,29 +6,30 @@ Point it at a public GitHub repo and two AI agents review your code concurrently
 
 ## Architecture
 
-```
-curl POST /review { "repo_url": "https://github.com/..." }
-        │
-        ▼  (async — returns 202 immediately)
-┌─────────────────────────┐
-│  Orchestrator            │  Durable Function
-│  step: clone repo        │──────▶ writes to /mnt/workspace
-│  parallel:               │
-│    invoke security agent │──────▶ reads files, calls Bedrock
-│    invoke style agent    │──────▶ reads files, calls Bedrock
-│  step: write summary     │──────▶ writes to /mnt/workspace
-└─────────────────────────┘
-        │
-        ▼
-   S3 Bucket (mounted via S3 Files at /mnt/workspace)
-   └── lambda/
-       └── {repo-name}/
-           ├── source/          ← cloned repo files
-           ├── manifest.json    ← file listing
-           └── reviews/
-               ├── security.json
-               ├── style.json
-               └── summary.json
+```mermaid
+flowchart TB
+    Client["curl POST /review"] -->|async 202| API["API Gateway"]
+    API -->|X-Amz-Invocation-Type: Event| Orch
+
+    subgraph Orch["Orchestrator (Durable Function)"]
+        direction TB
+        Clone["step: clone repo"] --> Parallel["parallel:"]
+        Parallel --> Security["invoke: security agent"]
+        Parallel --> Style["invoke: style agent"]
+        Security --> Summary["step: write summary"]
+        Style --> Summary
+    end
+
+    subgraph S3Files["S3 Bucket (mounted via S3 Files)"]
+        direction TB
+        Source["/{repo}/source/"]
+        Reviews["/{repo}/reviews/"]
+    end
+
+    Clone -->|"write files"| Source
+    Security -->|"read files → Bedrock → write findings"| Reviews
+    Style -->|"read files → Bedrock → write findings"| Reviews
+    Summary -->|"write summary.json"| Reviews
 ```
 
 ## What this demonstrates
