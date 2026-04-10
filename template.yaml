@@ -1,0 +1,464 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless Code Review Agents — S3 Files + Durable Functions demo.
+  A durable orchestrator clones a repo, then two Strands agents
+  review it in parallel via a shared S3 Files mount.
+
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 512
+    Timeout: 300
+    Architectures:
+      - arm64
+    Tracing: Active
+    Environment:
+      Variables:
+        WORKSPACE_MOUNT: /mnt/workspace
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-arm64:18
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-20250514-v1:0
+    Description: Bedrock model ID for the review agents
+
+Resources:
+  # ============================================================
+  # Networking
+  # ============================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: code-review-vpc
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: code-review-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: code-review-private-b
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: code-review-public
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions with S3 Files access
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  MountTargetSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for S3 Files mount targets
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref LambdaSG
+
+  # ============================================================
+  # Storage — S3 bucket + S3 Files file system
+  # ============================================================
+  WorkspaceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # IAM role that S3 Files (via EFS) assumes to access the bucket
+  S3FilesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3FilesAssumeRole
+            Effect: Allow
+            Principal:
+              Service: elasticfilesystem.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3files:${AWS::Region}:${AWS::AccountId}:file-system/*'
+      Policies:
+        - PolicyName: S3FilesBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3BucketPermissions
+                Effect: Allow
+                Action:
+                  - s3:ListBucket*
+                Resource: !GetAtt WorkspaceBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: S3ObjectPermissions
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject*
+                  - s3:GetObject*
+                  - s3:List*
+                  - s3:PutObject*
+                Resource: !Sub '${WorkspaceBucket.Arn}/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+
+  S3FileSystem:
+    Type: AWS::S3Files::FileSystem
+    Properties:
+      Bucket: !GetAtt WorkspaceBucket.Arn
+      RoleArn: !GetAtt S3FilesRole.Arn
+      AcceptBucketWarning: true
+
+  MountTargetA:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !GetAtt S3FileSystem.FileSystemId
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups:
+        - !Ref MountTargetSG
+
+  MountTargetB:
+    Type: AWS::S3Files::MountTarget
+    Properties:
+      FileSystemId: !GetAtt S3FileSystem.FileSystemId
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref MountTargetSG
+
+  S3FilesAccessPoint:
+    Type: AWS::S3Files::AccessPoint
+    Properties:
+      FileSystemId: !GetAtt S3FileSystem.FileSystemId
+      PosixUser:
+        Uid: '1000'
+        Gid: '1000'
+      RootDirectory:
+        Path: /lambda
+        CreationPermissions:
+          OwnerUid: '1000'
+          OwnerGid: '1000'
+          Permissions: '755'
+
+  # ============================================================
+  # Lambda Functions
+  # ============================================================
+
+  # --- Orchestrator (Durable Function) ---
+  OrchestratorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-orchestrator
+      Handler: app.handler
+      CodeUri: infrastructure/lambda/orchestrator/
+      Timeout: 900
+      DurableConfig:
+        ExecutionTimeout: 3600
+        RetentionPeriodInDays: 7
+      AutoPublishAlias: live
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          SECURITY_AGENT_ARN: !GetAtt SecurityAgentFunction.Arn
+          STYLE_AGENT_ARN: !GetAtt StyleAgentFunction.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !GetAtt SecurityAgentFunction.Arn
+                - !Sub '${SecurityAgentFunction.Arn}:*'
+                - !GetAtt StyleAgentFunction.Arn
+                - !Sub '${StyleAgentFunction.Arn}:*'
+            - Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+      Events:
+        StartReview:
+          Type: Api
+          Properties:
+            Path: /review
+            Method: post
+            RestApiId: !Ref CodeReviewApi
+
+  CodeReviewApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: CodeReviewApi
+      StageName: Prod
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: Code Review API
+          version: '1.0'
+        paths:
+          /review:
+            post:
+              summary: Start a code review
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Alias}/invocations'
+                credentials: !GetAtt ApiGatewayRole.Arn
+                passthroughBehavior: never
+                requestParameters:
+                  integration.request.header.X-Amz-Invocation-Type: "'Event'"
+                requestTemplates:
+                  application/json: |
+                    {
+                      "repo_url": $input.json('$.repo_url')
+                    }
+                responses:
+                  default:
+                    statusCode: 202
+                    responseTemplates:
+                      application/json: |
+                        {
+                          "status": "ACCEPTED",
+                          "message": "Code review started. Check the S3 bucket for results."
+                        }
+              responses:
+                '202':
+                  description: Review accepted
+
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt OrchestratorFunction.Arn
+                  - !Sub '${OrchestratorFunction.Arn}:*'
+                  - !Ref OrchestratorFunction.Alias
+
+  # --- Security Review Agent ---
+  SecurityAgentFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-security-agent
+      Handler: app.lambda_handler
+      CodeUri: infrastructure/lambda/security_agent/
+      Timeout: 600
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: '*'
+
+  # --- Style Review Agent ---
+  StyleAgentFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-style-agent
+      Handler: app.lambda_handler
+      CodeUri: infrastructure/lambda/style_agent/
+      Timeout: 600
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: '*'
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${CodeReviewApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/review'
+  WorkspaceBucketName:
+    Description: S3 bucket used as the shared workspace
+    Value: !Ref WorkspaceBucket
+  S3FileSystemId:
+    Description: S3 file system ID
+    Value: !GetAtt S3FileSystem.FileSystemId

@@ -1,0 +1,2 @@
+aws-durable-execution-sdk-python
+requests==2.32.3

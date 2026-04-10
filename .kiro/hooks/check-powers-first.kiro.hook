@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "name": "Check Powers First",
+  "description": "On every prompt, reminds the agent to check if any installed powers match the user's request keywords before taking action",
+  "version": "1",
+  "when": {
+    "type": "promptSubmit"
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Before doing anything else, check if the user's message matches keywords of any installed power. If it does, activate that power first and use its steering files to guide your workflow. Do not skip this step."
+  }
+}
