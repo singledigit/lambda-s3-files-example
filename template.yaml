@@ -1,26 +1,26 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Serverless Code Review Agents — S3 Files + Durable Functions + Strands SDK.
-  A durable orchestrator clones a public GitHub repo to a shared S3 Files mount,
-  then two Strands-powered agents review the code in parallel.
+  Serverless Code Review Agents — Two-tier event-driven architecture.
+  EventBridge coordinates two Durable Function pipelines:
+    DF1 (Analysis): clone → security + style agents in parallel → severity scorer
+    DF2 (Remediation): Kiro headless auto-fix → test generation → executive summary
+  S3 Files provides a shared POSIX workspace across all functions.
 
 # ════════════════════════════════════════════════════════════════
 # Globals
 # ════════════════════════════════════════════════════════════════
 Globals:
   Function:
-    Runtime: python3.13
-    MemorySize: 512
-    Timeout: 300
+    Runtime: python3.14
+    MemorySize: 1024
+    Timeout: 900
     Architectures:
       - arm64
     Tracing: Active
     Environment:
       Variables:
         WORKSPACE_MOUNT: /mnt/workspace
-    Layers:
-      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-arm64:18
 
 # ════════════════════════════════════════════════════════════════
 # Parameters
@@ -28,15 +28,12 @@ Globals:
 Parameters:
   BedrockModelId:
     Type: String
-    Default: us.anthropic.claude-sonnet-4-20250514-v1:0
+    Default: eu.anthropic.claude-sonnet-4-20250514-v1:0
     Description: Bedrock inference profile ID for the review agents
 
 Resources:
   # ════════════════════════════════════════════════════════════════
   # Networking (nested stack)
-  # VPC with private subnets, NAT gateway, and security groups.
-  # Lambda functions need a VPC to mount S3 Files, and a NAT
-  # gateway for outbound internet access (Bedrock API, GitHub).
   # ════════════════════════════════════════════════════════════════
   NetworkingStack:
     Type: AWS::Serverless::Application
@@ -45,12 +42,7 @@ Resources:
 
   # ════════════════════════════════════════════════════════════════
   # S3 Files — shared workspace
-  # The bucket stores the data. The file system makes it mountable.
-  # The access point controls POSIX identity and creates a writable
-  # root directory for Lambda (UID/GID 1000, /lambda path).
   # ════════════════════════════════════════════════════════════════
-
-  # S3 bucket — the source of truth for all data
   WorkspaceBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -63,13 +55,9 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      # Required: S3 Files needs versioning enabled on the bucket
       VersioningConfiguration:
         Status: Enabled
 
-  # IAM role that S3 Files assumes to sync data between the
-  # file system and the S3 bucket. The trust policy uses the EFS
-  # service principal because S3 Files is built on EFS.
   S3FilesRole:
     Type: AWS::IAM::Role
     Properties:
@@ -113,7 +101,6 @@ Resources:
                   StringEquals:
                     aws:ResourceAccount: !Ref AWS::AccountId
 
-  # S3 Files file system — bridges the bucket to NFS
   S3FileSystem:
     Type: AWS::S3Files::FileSystem
     Properties:
@@ -121,8 +108,6 @@ Resources:
       RoleArn: !GetAtt S3FilesRole.Arn
       AcceptBucketWarning: true
 
-  # Mount targets — network endpoints in each AZ so Lambda can
-  # connect to the file system. One per AZ, ~5 min to create.
   MountTargetA:
     Type: AWS::S3Files::MountTarget
     Properties:
@@ -139,9 +124,6 @@ Resources:
       SecurityGroups:
         - !GetAtt NetworkingStack.Outputs.MountTargetSGId
 
-  # Access point — controls POSIX identity for Lambda.
-  # Lambda needs UID/GID 1000:1000 and a writable root directory.
-  # CreationPermissions auto-creates /lambda with the right ownership.
   S3FilesAccessPoint:
     Type: AWS::S3Files::AccessPoint
     Properties:
@@ -158,9 +140,8 @@ Resources:
 
   # ════════════════════════════════════════════════════════════════
   # API Gateway
-  # Uses an OpenAPI definition to invoke the durable orchestrator
-  # asynchronously (X-Amz-Invocation-Type: Event). Returns 202
-  # immediately — check the S3 bucket for results.
+  # Publishes review.requested event to the default EventBridge bus.
+  # Returns 202 immediately.
   # ════════════════════════════════════════════════════════════════
   CodeReviewApi:
     Type: AWS::Serverless::Api
@@ -171,7 +152,7 @@ Resources:
         openapi: 3.0.1
         info:
           title: Code Review API
-          version: '1.0'
+          version: '2.0'
         paths:
           /review:
             post:
@@ -179,15 +160,20 @@ Resources:
               x-amazon-apigateway-integration:
                 type: aws
                 httpMethod: POST
-                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OrchestratorFunction.Alias}/invocations'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:events:action/PutEvents'
                 credentials: !GetAtt ApiGatewayRole.Arn
                 passthroughBehavior: never
-                requestParameters:
-                  integration.request.header.X-Amz-Invocation-Type: "'Event'"
                 requestTemplates:
                   application/json: |
+                    #set($body = $input.json('$'))
                     {
-                      "repo_url": $input.json('$.repo_url')
+                      "Entries": [
+                        {
+                          "Source": "code-review.api",
+                          "DetailType": "review.requested",
+                          "Detail": "{\"repo_url\": $input.json('$.repo_url')}"
+                        }
+                      ]
                     }
                 responses:
                   default:
@@ -196,7 +182,7 @@ Resources:
                       application/json: |
                         {
                           "status": "ACCEPTED",
-                          "message": "Code review started. Check the S3 bucket for results."
+                          "message": "Code review requested. Events will coordinate the pipeline."
                         }
               responses:
                 '202':
@@ -213,39 +199,44 @@ Resources:
               Service: apigateway.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: InvokeLambda
+        - PolicyName: PutEvents
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource:
-                  - !GetAtt OrchestratorFunction.Arn
-                  - !Sub '${OrchestratorFunction.Arn}:*'
-                  - !Ref OrchestratorFunction.Alias
+                Action: events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
 
   # ════════════════════════════════════════════════════════════════
-  # Lambda Functions
+  # DF1 — Analysis Pipeline
+  # Clone → Security + Style agents (parallel) → Severity Scorer
+  # Emits analysis.complete when done.
+  # Triggered by review.requested on the default bus (implicit event).
   # ════════════════════════════════════════════════════════════════
-
-  # Orchestrator — durable function that coordinates the pipeline:
-  #   1. Clone repo to the S3 Files mount (context.step)
-  #   2. Invoke security + style agents in parallel (context.invoke)
-  #   3. Write combined summary to the workspace
-  OrchestratorFunction:
+  AnalysisPipelineFunction:
     Type: AWS::Serverless::Function
     DependsOn:
       - MountTargetA
       - MountTargetB
     Properties:
-      FunctionName: code-review-orchestrator
+      FunctionName: code-review-analysis-pipeline
       Handler: app.handler
-      CodeUri: src/orchestrator/
+      CodeUri: src/analysis_pipeline/
+      MemorySize: 512
       Timeout: 900
       DurableConfig:
         ExecutionTimeout: 3600
         RetentionPeriodInDays: 7
       AutoPublishAlias: live
+      Events:
+        ReviewRequested:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - code-review.api
+              detail-type:
+                - review.requested
       VpcConfig:
         SecurityGroupIds:
           - !GetAtt NetworkingStack.Outputs.LambdaSGId
@@ -259,6 +250,7 @@ Resources:
         Variables:
           SECURITY_AGENT_ARN: !GetAtt SecurityAgentFunction.Arn
           STYLE_AGENT_ARN: !GetAtt StyleAgentFunction.Arn
+          SEVERITY_SCORER_ARN: !GetAtt SeverityScorerFunction.Arn
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -270,6 +262,8 @@ Resources:
                 - !Sub '${SecurityAgentFunction.Arn}:*'
                 - !GetAtt StyleAgentFunction.Arn
                 - !Sub '${StyleAgentFunction.Arn}:*'
+                - !GetAtt SeverityScorerFunction.Arn
+                - !Sub '${SeverityScorerFunction.Arn}:*'
             - Sid: MountS3Files
               Effect: Allow
               Action:
@@ -277,10 +271,12 @@ Resources:
                 - s3files:ClientWrite
                 - s3files:ClientRootAccess
               Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Sid: EmitEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
 
-  # Security agent — Strands agent that reads source files from the
-  # mount, calls Bedrock to analyze for security issues, and writes
-  # findings back to the mount. No boto3 for file access.
+  # Security agent — Strands agent for vulnerability scanning
   SecurityAgentFunction:
     Type: AWS::Serverless::Function
     DependsOn:
@@ -323,8 +319,7 @@ Resources:
                 - bedrock:ConverseStream
               Resource: '*'
 
-  # Style agent — same pattern as security, different system prompt.
-  # Reviews for code quality, naming, documentation, consistency.
+  # Style agent — Strands agent for code quality review
   StyleAgentFunction:
     Type: AWS::Serverless::Function
     DependsOn:
@@ -335,6 +330,247 @@ Resources:
       Handler: app.lambda_handler
       CodeUri: src/style_agent/
       Timeout: 600
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkingStack.Outputs.LambdaSGId
+        SubnetIds:
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetAId
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetBId
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: MountS3Files
+              Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Sid: InvokeBedrock
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: '*'
+
+  # Severity scorer — scores and prioritizes security findings
+  SeverityScorerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-severity-scorer
+      Handler: app.lambda_handler
+      CodeUri: src/severity_scorer_agent/
+      Timeout: 300
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkingStack.Outputs.LambdaSGId
+        SubnetIds:
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetAId
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetBId
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: MountS3Files
+              Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Sid: InvokeBedrock
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: '*'
+
+  # ════════════════════════════════════════════════════════════════
+  # DF2 — Remediation Pipeline
+  # Kiro headless auto-fix → Test generation → Executive summary
+  # Emits remediation.complete when done.
+  # Triggered by analysis.complete on the default bus (implicit event).
+  # ════════════════════════════════════════════════════════════════
+  RemediationPipelineFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-remediation-pipeline
+      Handler: app.handler
+      CodeUri: src/remediation_pipeline/
+      MemorySize: 512
+      Timeout: 900
+      DurableConfig:
+        ExecutionTimeout: 3600
+        RetentionPeriodInDays: 7
+      AutoPublishAlias: live
+      Events:
+        AnalysisComplete:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - code-review.analysis
+              detail-type:
+                - analysis.complete
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkingStack.Outputs.LambdaSGId
+        SubnetIds:
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetAId
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetBId
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          KIRO_AGENT_ARN: !GetAtt KiroAutoFixFunction.Arn
+          TEST_GEN_AGENT_ARN: !GetAtt TestGenAgentFunction.Arn
+          SUMMARY_AGENT_ARN: !GetAtt ExecutiveSummaryFunction.Arn
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: InvokeAgents
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt KiroAutoFixFunction.Arn
+                - !Sub '${KiroAutoFixFunction.Arn}:*'
+                - !GetAtt TestGenAgentFunction.Arn
+                - !Sub '${TestGenAgentFunction.Arn}:*'
+                - !GetAtt ExecutiveSummaryFunction.Arn
+                - !Sub '${ExecutiveSummaryFunction.Arn}:*'
+            - Sid: MountS3Files
+              Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Sid: EmitEvents
+              Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+
+  # Kiro headless — auto-fix agent that reasons over the full codebase
+  KiroAutoFixFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-kiro-autofix
+      Handler: app.lambda_handler
+      CodeUri: src/kiro_autofix_agent/
+      Timeout: 900
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkingStack.Outputs.LambdaSGId
+        SubnetIds:
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetAId
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetBId
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: MountS3Files
+              Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Sid: InvokeBedrock
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: '*'
+
+  # Test generation agent — validates fixes with generated tests
+  TestGenAgentFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-test-gen-agent
+      Handler: app.lambda_handler
+      CodeUri: src/test_gen_agent/
+      Timeout: 600
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt NetworkingStack.Outputs.LambdaSGId
+        SubnetIds:
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetAId
+          - !GetAtt NetworkingStack.Outputs.PrivateSubnetBId
+      FileSystemConfigs:
+        - Arn: !GetAtt S3FilesAccessPoint.AccessPointArn
+          LocalMountPath: /mnt/workspace
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: MountS3Files
+              Effect: Allow
+              Action:
+                - s3files:ClientMount
+                - s3files:ClientWrite
+                - s3files:ClientRootAccess
+              Resource: !GetAtt S3FileSystem.FileSystemArn
+            - Sid: InvokeBedrock
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+              Resource: '*'
+
+  # Executive summary agent — fans-in all results into final report
+  ExecutiveSummaryFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      FunctionName: code-review-executive-summary
+      Handler: app.lambda_handler
+      CodeUri: src/executive_summary_agent/
+      Timeout: 300
       MemorySize: 1024
       VpcConfig:
         SecurityGroupIds:

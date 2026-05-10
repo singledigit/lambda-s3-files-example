@@ -10,9 +10,10 @@ from pathlib import Path
 
 from strands import Agent, tool
 from strands.models import BedrockModel
-from aws_lambda_powertools import Logger
+import logging
 
-logger = Logger()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 WORKSPACE = os.environ.get("WORKSPACE_MOUNT", "/mnt/workspace")
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-20250514-v1:0")

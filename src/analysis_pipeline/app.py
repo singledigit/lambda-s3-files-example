@@ -1,9 +1,14 @@
 """
-Orchestrator — Durable function that coordinates the code review pipeline.
+Analysis Pipeline (DF1) — Durable function that coordinates code analysis.
 
-1. Downloads a public GitHub repo to the S3 Files mount (step)
-2. Invokes security and style agents in parallel (context.invoke)
-3. Writes a combined summary to the shared workspace
+Triggered by: review.requested event from EventBridge
+Steps:
+  1. Clone repo to S3 Files mount
+  2. Run security + style agents in parallel
+  3. Run severity scorer (depends on security findings)
+  4. Emit analysis.complete event to EventBridge
+
+All agents share the S3 Files workspace at /mnt/workspace.
 """
 
 import io
@@ -12,6 +17,7 @@ import os
 import tarfile
 from pathlib import Path
 
+import boto3
 import requests
 from aws_durable_execution_sdk_python import (
     DurableContext,
@@ -20,13 +26,12 @@ from aws_durable_execution_sdk_python import (
     StepContext,
 )
 from aws_durable_execution_sdk_python.config import ParallelConfig
-from aws_lambda_powertools import Logger
-
-logger = Logger()
 
 WORKSPACE = os.environ.get("WORKSPACE_MOUNT", "/mnt/workspace")
 SECURITY_AGENT_ARN = os.environ.get("SECURITY_AGENT_ARN", "")
 STYLE_AGENT_ARN = os.environ.get("STYLE_AGENT_ARN", "")
+SEVERITY_SCORER_ARN = os.environ.get("SEVERITY_SCORER_ARN", "")
+EVENT_BUS_NAME = "default"
 
 # File extensions we care about for code review
 CODE_EXTENSIONS = {
@@ -111,32 +116,52 @@ def clone_repo(step_ctx: StepContext, repo_url: str, review_id: str):
     return {"files_extracted": file_count, "files_skipped": skipped}
 
 
+@durable_step
+def emit_analysis_complete(step_ctx: StepContext, review_id: str, repo_url: str, results: dict):
+    """Emit analysis.complete event to EventBridge to trigger DF2."""
+    client = boto3.client("events")
+    client.put_events(
+        Entries=[
+            {
+                "Source": "code-review.analysis",
+                "DetailType": "analysis.complete",
+                "Detail": json.dumps({
+                    "review_id": review_id,
+                    "repo_url": repo_url,
+                    "results": results,
+                }),
+                "EventBusName": EVENT_BUS_NAME,
+            }
+        ]
+    )
+    return {"event_emitted": "analysis.complete", "review_id": review_id}
+
+
 @durable_execution
 def handler(event: dict, context: DurableContext) -> dict:
     """
-    Orchestrate a code review:
-    1. Clone the repo to the shared workspace (step)
-    2. Run security + style reviews in parallel (invoke)
-    3. Write combined summary
+    Analysis Pipeline (DF1):
+    1. Clone the repo to the shared workspace
+    2. Run security + style reviews in parallel
+    3. Run severity scorer on security findings
+    4. Emit analysis.complete event
     """
-    body = event
-    if "body" in event:
-        body = json.loads(event["body"]) if isinstance(event.get("body"), str) else event.get("body", {})
-
-    repo_url = body.get("repo_url", "")
+    # Extract event detail (EventBridge wraps in detail)
+    detail = event.get("detail", event)
+    repo_url = detail.get("repo_url", "")
     if not repo_url:
-        return _api_response(400, {"error": "repo_url is required"})
+        return {"error": "repo_url is required"}
 
     repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
     review_id = repo_name
 
-    context.logger.info(f"Starting code review for {repo_url}")
+    context.logger.info(f"[DF1] Starting analysis pipeline for {repo_url}")
 
     # Step 1: Clone the repo
     clone_result = context.step(clone_repo(repo_url, review_id))
-    context.logger.info(f"Clone complete: {clone_result}")
+    context.logger.info(f"[DF1] Clone complete: {clone_result}")
 
-    # Step 2: Run reviews in parallel
+    # Step 2: Run security + style reviews in parallel
     def security_review(ctx: DurableContext):
         return ctx.invoke(
             SECURITY_AGENT_ARN,
@@ -151,39 +176,45 @@ def handler(event: dict, context: DurableContext) -> dict:
             name="style-review",
         )
 
-    results = context.parallel(
+    review_results = context.parallel(
         [security_review, style_review],
         name="parallel-reviews",
         config=ParallelConfig(max_concurrency=2),
     )
 
-    security_result, style_result = results.get_results()
+    security_result, style_result = review_results.get_results()
+    context.logger.info("[DF1] Parallel reviews complete")
 
-    # Step 3: Write combined summary
-    summary = {
-        "repo_url": repo_url,
-        "review_id": review_id,
+    # Step 3: Severity scorer — depends on security findings
+    severity_result = context.invoke(
+        SEVERITY_SCORER_ARN,
+        {"review_id": review_id, "security_findings": security_result},
+        name="severity-scoring",
+    )
+    context.logger.info("[DF1] Severity scoring complete")
+
+    # Combine analysis results
+    analysis_results = {
         "clone": clone_result,
         "security_review": security_result,
         "style_review": style_result,
+        "severity_scoring": severity_result,
     }
 
-    summary_path = Path(WORKSPACE) / review_id / "reviews" / "summary.json"
+    # Write analysis summary to workspace
+    summary_path = Path(WORKSPACE) / review_id / "reviews" / "analysis_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summary, indent=2, default=str))
+    summary_path.write_text(json.dumps(analysis_results, indent=2, default=str))
 
-    context.logger.info("Review complete")
+    # Step 4: Emit analysis.complete event to trigger DF2
+    context.step(emit_analysis_complete(review_id, repo_url, analysis_results))
 
-    return _api_response(200, {
-        "message": f"Code review complete for {repo_url}",
-        "review_id": review_id,
-        "results": summary,
-    })
+    context.logger.info("[DF1] Analysis pipeline complete — event emitted")
 
-
-def _api_response(status_code: int, body: dict) -> dict:
     return {
-        "statusCode": status_code,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps(body, default=str),
+        "review_id": review_id,
+        "repo_url": repo_url,
+        "pipeline": "analysis",
+        "status": "complete",
+        "results": analysis_results,
     }
