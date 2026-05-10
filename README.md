@@ -2,7 +2,9 @@
 
 AI-powered code review and auto-remediation using **S3 Files**, **Durable Functions**, **Strands Agents SDK**, and **EventBridge**.
 
-Point it at a public GitHub repo and a two-tier event-driven pipeline analyzes your code, scores findings by severity, auto-fixes issues, generates validation tests, and produces an executive summary — all coordinated by EventBridge and Durable Functions.
+This project expands on the demo from [S3 Files + Lambda Agents](https://edjgeek.com/blog/s3-files-lambda-agents/), which introduced the analysis pipeline. Here we add a full remediation tier — auto-fixing issues, generating validation tests, and producing an executive summary — all coordinated by EventBridge across two Durable Function pipelines.
+
+Point it at a public GitHub repo and the pipeline analyzes your code, scores findings by severity, auto-fixes issues, generates validation tests, and produces an executive summary.
 
 ## Architecture
 
@@ -94,7 +96,7 @@ All artifacts are written to the S3 Files mount at `/{repo}/reviews/`:
 - **AWS CLI** configured with credentials for Lambda, S3, VPC, IAM, API Gateway, EventBridge, and Bedrock
 - **AWS SAM CLI** v1.153+ ([install guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html))
 - **Bedrock model access** enabled for Claude Sonnet 4 in your target region
-- **Python 3.14** (runtime) — no local Python needed if using container builds
+- **Python 3.14** (runtime)
 
 ## Setup
 
@@ -111,6 +113,12 @@ cd lambda-s3-files-example
 sam build
 ```
 
+If you don't have Python 3.14 installed locally, use a container build (requires Docker or Finch). SAM needs a matching Python version to install dependencies with the correct native binaries for the Lambda runtime:
+
+```bash
+sam build --use-container
+```
+
 ### 3. Deploy
 
 ```bash
@@ -120,9 +128,8 @@ sam deploy
 The `samconfig.toml` is pre-configured with:
 - Stack name: `code-review-agents`
 - Region: `eu-central-1`
-- Profile: `demo`
 - Cached + parallel builds
-- Auto-confirm changesets
+- No changeset confirmation (deploys immediately)
 - Disable rollback (for easier iteration)
 
 First deploy takes **10-15 minutes** (VPC, NAT gateway, and S3 Files mount targets take time to provision).
