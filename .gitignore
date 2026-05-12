@@ -1,7 +1,7 @@
 .aws-sam/
 blog/
 social/
-.kiro/hooks/
+.kiro/
 samconfig.toml
 hand-drawn-diagrams/
 __pycache__/
